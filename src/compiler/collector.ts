@@ -13,9 +13,44 @@ const TypeFlags = typescript.TypeFlags;
  */
 export default class Collector {
   types: types.TypeMap = {
-    Date: {type: 'alias', target: {type: 'string'}},
-    DateTime: {type: 'alias', target: {type: 'string'}},
-    Long: {type: 'alias', target: {type: 'string'}},
+    graphql: {type: 'import', imports: ['GraphQLResolveInfo']},
+    ID: {type: 'alias', target: {type: 'string'}},
+    Long: {type: 'alias', target: {type: 'number'}},
+    '__Resolver<R, A, T>': {
+      type: 'alias',
+      target: {
+        type: 'method',
+        name: '',
+        parameters: {
+          root: {
+            type: 'reference',
+            target: 'R'
+          },
+          args: {
+            type: 'reference',
+            target: 'A'
+          },
+          ctx: {
+            type: 'reference',
+            target: '__ContextType'
+          },
+          info: {
+            type: 'reference',
+            target: 'GraphQLResolveInfo'
+          }
+        },
+        returns: {
+          type: 'union',
+          types: [{
+            type: 'reference',
+            target: 'T'
+          }, {
+            type: 'reference',
+            target: 'Promise<T>'
+          }]
+        }
+      }
+    }
   };
   private checker: typescript.TypeChecker;
   private nodeMap: Map<typescript.Node, types.Node> = new Map();

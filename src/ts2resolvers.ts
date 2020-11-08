@@ -43,5 +43,11 @@ export async function tsToResolvers(): Promise<any> {
         store.outputResolversDir = answer.outputResolversDir;
     }
 
+    if ((configFile.config || {}).context) {
+        store.context = configFile.config.context;
+    } else {
+        showError(`Cannot find config.context in ${configFileName}\nContext will be set to type '{[key: string]: any}'.`);
+    }
+
     await resolversActions();
 }

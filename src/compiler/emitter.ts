@@ -8,7 +8,25 @@ import { ReferenceNode } from './types';
 export default class Emitter {
     renames: {[key: string]: string} = {};
     enumNames: string[] = [];
-    scalarNames: string[] = [];
+    scalarNames: string[] = ['Date'];
+    queryResolvers: Types.InterfaceNode = {
+        type: 'interface',
+        members: [],
+        inherits: ['Query'],
+        concrete: false
+    };
+    mutationResolvers: Types.InterfaceNode = {
+        type: 'interface',
+        members: [],
+        inherits: ['Mutation'],
+        concrete: false
+    };
+    allResolvers: Types.InterfaceNode = {
+        type: 'interface',
+        members: [],
+        inherits: [],
+        concrete: false
+    };
 
     constructor(private types: Types.TypeMap) {
         this.types = <Types.TypeMap>_.omitBy(types, (node, name) => this._preprocessNode(node, name!));
@@ -17,6 +35,31 @@ export default class Emitter {
     emitAll(stream: NodeJS.WritableStream) {
         stream.write('\n');
         _.each(this.types, (node, name) => this.emitTopLevelNode(node, name!, stream));
+
+        // QueryResolvers
+        this.emitTopLevelNode(this.queryResolvers, 'QueryResolvers', stream);
+        this.allResolvers.members.push({
+            type: 'property',
+            name: 'Query',
+            signature: {
+                type: 'reference',
+                target: `QueryResolvers`
+            }
+        });
+
+        // MutationResolvers
+        this.emitTopLevelNode(this.mutationResolvers, 'MutationResolvers', stream);
+        this.allResolvers.members.push({
+            type: 'property',
+            name: 'Mutation',
+            signature: {
+                type: 'reference',
+                target: `MutationResolvers`
+            }
+        });
+
+        // Resolvers
+        this.emitTopLevelNode(this.allResolvers, 'Resolvers', stream);
     }
 
     emitTopLevelNode(node: Types.Node, name: Types.SymbolName, stream: NodeJS.WritableStream) {
@@ -27,6 +70,8 @@ export default class Emitter {
             content = this._emitInterface(node, name);
         } else if (node.type === 'enum') {
           content = this._emitEnum(node, name);
+        } else if (node.type === 'import') {
+            content = this._emitImport(node, name);
         } else {
             throw new Error(`Can't emit ${node.type} as a top level node`);
         }
@@ -89,34 +134,36 @@ export default class Emitter {
     _emitAlias(node: Types.AliasNode, name: Types.SymbolName): string {
         if (this._isPrimitive(node.target)) {
             this.scalarNames.push(this._name(name));
-            return `scalar ${this._name(name)}`;
+            return `export type ${this._name(name)} = ${node.target.type};`;
+        } else if (node.target.type === 'method') {
+            return `export type ${this._name(name)} = ${this._emitMethod(node.target)};`;
+        } else if (node.target.type === 'property') {
+            return `export type ${this._name(name)} = ${this._emitProperty(node.target)};`;
         } else if (node.target.type === 'reference') {
-            return `union ${this._name(name)} = ${this._name(node.target.target)}`;
-        } else if (node.target.type === 'union') {
-            return this._emitUnion(node.target, name);
+            return `export type ${this._name(name)} = ${this._name(node.target.target)};`;
         } else {
-            throw new Error(`Can't serialize ${JSON.stringify(node.target)} as an alias`);
+            return `export type ${this._name(name)} = ${this._emitExpression(node.target)};`;
         }
     }
 
     _emitEnum(node:Types.EnumNode, name:Types.SymbolName):string {
         this.enumNames.push(this._name(name));
-        return `enum ${this._name(name)} {\n${this._indent(node.values)}\n}`;
+        return `enum ${this._name(name)} {\n${this._indent(node.values.join(',\n'))}\n}`;
+    }
+
+    _emitImport(node:Types.ImportNode, name:Types.SymbolName):string {
+        return `import ${node.default ? `${node.default}, ` : ''}{\n${this._indent(node.imports || [])}\n} from '${name}';`;
     }
 
     _emitExpression = (node: Types.Node): string => {
         if (!node) {
             return '';
-        } else if (node.type === 'string') {
-            return 'String'; // TODO: ID annotation
-        } else if (node.type === 'number') {
-            return 'Float'; // TODO: Int/Float annotation
-        } else if (node.type === 'boolean') {
-            return 'Boolean';
         } else if (node.type === 'reference') {
             return this._name(node.target);
         } else if (node.type === 'array') {
-            return `[${node.elements.map(this._emitExpression).join(' | ')}]`;
+            return `[${node.elements.map(this._emitExpression).join(', ')}]`;
+        } else if (node.type === 'union') {
+            return this._emitUnion(node);
         } else if (node.type === 'literal object' || node.type === 'interface') {
             return _(this._collectMembers(node))
                 .map((member:Types.PropertyNode) => {
@@ -124,74 +171,34 @@ export default class Emitter {
                 })
                 .join(', ');
         } else {
-            throw new Error(`Can't serialize ${node.type} as an expression`);
+            return node.type;
         }
     }
 
     _emitInterface(node: Types.InterfaceNode, name: Types.SymbolName): string {
-        // GraphQL expects denormalized type interfaces
-        const members = <Types.Node[]>_(this._transitiveInterfaces(node))
-            .map((i: Types.InterfaceNode) => i.members)
-            .flatten()
-            .uniqBy('name')
-            .sortBy('name')
-            .value();
-    
-        // GraphQL can't handle empty types or interfaces, but we also don't want
-        // to remove all references (complicated).
-        if (!members.length) {
-            members.push({
-                type: 'property',
-                name: '_placeholder',
-                signature: { type: 'boolean' },
-            });
-        }
+        const members = node.members;
+
+        let extendsSection = node.inherits.length ? ` extends ${node.inherits.join(', ')}` : '';
     
         const properties = _.map(members, (member) => {
             if (member.type === 'method') {
-                let parameters = '';
-                if (_.size(member.parameters) > 1) {
-                    throw new Error(`Methods can have a maximum of 1 argument`);
-                } else if (_.size(member.parameters) === 1) {
-                    let argType = _.values(member.parameters)[0] as Types.Node;
-                    if (argType.type === 'reference') {
-                        argType = this.types[argType.target];
-                    }
-                    parameters = `(${this._emitExpression(argType)})`;
-                }
-                const returnType = this._emitExpression(member.returns);
-                const costDecorator = this._costHelper(member);
-                const directives = this._directiveHelper(member);
-                return `${this._name(member.name)}${parameters}: ${returnType}${costDecorator}${directives}`;
+                return `${this._emitMethod(member)};`;
             } else if (member.type === 'property') {
-                // TODO: if property is a reference to the plural of a type, create the appropriate params (where, orderBy, skip...)
-                const costDecorator = this._costHelper(member);
-                const directives = this._directiveHelper(member);
-                const mark = member.optional ? '' : '!';
-                return `${this._name(member.name)}: ${this._emitExpression(member.signature)}${mark}${costDecorator}${directives}`;
-            } else {
-                throw new Error(`Can't serialize ${member.type} as a property of an interface`);
+                return `${this._emitProperty(member)};`;
             }
+            return '';
         });
     
         if (this._getDocTag(node, 'schema')) {
-            return `schema {\n${this._indent(properties)}\n}`;
+            return '';
         } else if (this._getDocTag(node, 'input')) {
-            return `input ${this._name(name)} {\n${this._indent(properties)}\n}`;
+            return `export interface ${this._name(name)}${extendsSection} {\n${this._indent(properties)}\n}`;
         }
     
         if (node.concrete) {
-            // If tagged with a "key" graphql tag, add the @key annotation for federation
-            const federationDecorator = this._getDocTags(node, 'key')
-                .map(tag => ` @key(fields: "${tag.substring(4)}")`)
-                .join('');
-            const costDecorator = this._costHelper(node);
-            const directives = this._directiveHelper(node);
-
-            let result = `type ${this._name(name)}${federationDecorator}${costDecorator}${directives} {\n${this._indent(properties)}\n}`;
+            let result = `export interface ${this._name(name)}${extendsSection} {\n${this._indent(properties)}\n}`;
 
             if (name.toLowerCase() !== 'query' && name.toLowerCase() !== 'mutation'&& !name.startsWith('_')) {
-                // TODO: consider putting these extended emissions under a boolean flag so it can be turned off by user
 
                 // batch payload
                 result = `${result}\n\n${this._emitInterfaceBatchPayload(node, name)}`;
@@ -205,8 +212,23 @@ export default class Emitter {
                 // create one input
                 result = `${result}\n\n${this._emitInterfaceCreateOneInput(node, name)}`;
 
+                // create one mutation args
+                result = `${result}\n\n${this._emitInterfaceCreateOneMutationArgs(node, name)}`;
+
+                // delete many mutation args
+                result = `${result}\n\n${this._emitInterfaceDeleteManyMutationArgs(node, name)}`;
+
+                // find one query args
+                result = `${result}\n\n${this._emitInterfaceFindOneQueryArgs(node, name)}`;
+
+                // find many query args
+                result = `${result}\n\n${this._emitInterfaceFindManyQueryArgs(node, name)}`;
+
                 // order by input
                 result = `${result}\n\n${this._emitInterfaceOrderByInput(node, name)}`;
+
+                // payload
+                result = `${result}\n\n${this._emitInterfacePayload(node, name)}`;
 
                 // update input
                 result = `${result}\n\n${this._emitInterfaceUpdateInput(node, name)}`;
@@ -214,11 +236,20 @@ export default class Emitter {
                 // update many input
                 result = `${result}\n\n${this._emitInterfaceUpdateManyInput(node, name)}`;
 
+                // update many mutation args
+                result = `${result}\n\n${this._emitInterfaceUpdateManyMutationArgs(node, name)}`;
+
                 // update many mutation input
                 result = `${result}\n\n${this._emitInterfaceUpdateManyMutationInput(node, name)}`;
 
                 // update one input
                 result = `${result}\n\n${this._emitInterfaceUpdateOneInput(node, name)}`;
+
+                // update one mutation args
+                result = `${result}\n\n${this._emitInterfaceUpdateOneMutationArgs(node, name)}`;
+
+                // upsert one mutation args
+                result = `${result}\n\n${this._emitInterfaceUpsertOneMutationArgs(node, name)}`;
 
                 // where input
                 result = `${result}\n\n${this._emitInterfaceWhereInput(node, name)}`;
@@ -227,16 +258,16 @@ export default class Emitter {
                 result = `${result}\n\n${this._emitInterfaceWhereUniqueInput(node, name)}`;
 
                 // query extension
-                result = `${result}\n\n${this._emitQueryExtension(node, name)}`;
+                this._emitQueryExtension(node, name);
 
                 // mutation extension
-                result = `${result}\n\n${this._emitMutationExtension(node, name)}`;
+                this._emitMutationExtension(node, name);
             }
 
             return result;
         }
     
-        let result = `interface ${this._name(name)} {\n${this._indent(properties)}\n}`;
+        let result = `export interface ${this._name(name)}${extendsSection} {\n${this._indent(properties)}\n}`;
 
         const fragmentDeclaration = this._getDocTag(node, 'fragment');
         if (fragmentDeclaration) {
@@ -247,11 +278,14 @@ export default class Emitter {
     }
 
     _emitInterfaceBatchPayload(node: Types.InterfaceNode, name: Types.SymbolName): string {
+        const camelCasedName = name.charAt(0).toLowerCase() + name.substr(1);
         const properties = [
-            `count: Long`
+            `count: Long;`,
+            `errors?: Error[];`,
+            `${camelCasedName}s?: ${name}[];`,
         ];
     
-        return `type ${name}BatchPayload {\n${this._indent(properties)}\n}`;
+        return `export interface ${name}BatchPayload {\n${this._indent(properties)}\n}`;
     }
 
     _emitInterfaceCreateInput(node: Types.InterfaceNode, name: Types.SymbolName): string {
@@ -288,50 +322,82 @@ export default class Emitter {
             }
         });
     
-        return `input ${name}CreateInput {\n${this._indent(properties.filter(p => !!(p)))}\n}`;
+        return `export interface ${name}CreateInput {\n${this._indent(properties.filter(p => !!(p)))}\n}`;
     }
 
     _emitInterfaceCreateInputClauses = (node: Types.Node, name: Types.SymbolName, optional: boolean = false): string => {
         const expression = this._emitExpression(node);
-        const mark = optional ? '' : '!';
+        const mark = optional ? '?' : '';
 
         if (!node) {
             return '';
         } else if (expression === 'ID') {
-            return `${name}: ${expression}`; // always optional, so can't end with "!"
+            return `${name}?: ${expression};`; // always optional
         } else if (node.type === 'alias') {
-            return this._emitInterfaceCreateInputClauses(node.target, name);
+            return this._emitInterfaceCreateInputClauses(node.target, name, optional);
         } else if (node.type === 'array') {
             if (node.elements[0].type === 'reference') {
-                return `${name}: ${node.elements[0].target}CreateManyInput${mark}`;
+                return `${name}${mark}: ${node.elements[0].target}CreateManyInput;`;
             } else {
-                return `${name}: ${expression}${mark}`;
+                return `${name}${mark}: ${expression};`;
             }
         } else if (node.type === 'reference') {
             if (this.enumNames.includes(expression) || this.scalarNames.includes(expression)) {
-                return `${name}: ${expression}${mark}`;
+                return `${name}${mark}: ${expression};`;
             } else {
-                return `${name}: ${node.target}CreateOneInput${mark}`;
+                return `${name}${mark}: ${node.target}CreateOneInput;`;
             }
         } else {
-            return `${name}: ${expression}${mark}`;
+            return `${name}${mark}: ${expression};`;
         }
     }
 
     _emitInterfaceCreateManyInput(node: Types.InterfaceNode, name: Types.SymbolName): string {
         const properties = [
-            `connect: [${name}WhereUniqueInput!]`
+            `connect?: ${name}WhereUniqueInput[];`
         ];
     
-        return `input ${name}CreateManyInput {\n${this._indent(properties)}\n}`;
+        return `export interface ${name}CreateManyInput {\n${this._indent(properties)}\n}`;
     }
 
     _emitInterfaceCreateOneInput(node: Types.InterfaceNode, name: Types.SymbolName): string {
         const properties = [
-            `connect: ${name}WhereUniqueInput`
+            `connect?: ${name}WhereUniqueInput;`
         ];
     
-        return `input ${name}CreateOneInput {\n${this._indent(properties)}\n}`;
+        return `export interface ${name}CreateOneInput {\n${this._indent(properties)}\n}`;
+    }
+
+    _emitInterfaceCreateOneMutationArgs(node: Types.InterfaceNode, name: Types.SymbolName): string {
+        const properties = [`data: ${name}CreateInput;`];
+    
+        return `export interface ${name}CreateOneMutationArgs {\n${this._indent(properties)}\n}`;
+    }
+
+    _emitInterfaceDeleteManyMutationArgs(node: Types.InterfaceNode, name: Types.SymbolName): string {
+        const properties = [`where: ${name}WhereInput;`];
+    
+        return `export interface ${name}DeleteManyMutationArgs {\n${this._indent(properties)}\n}`;
+    }
+
+    _emitInterfaceFindOneQueryArgs(node: Types.InterfaceNode, name: Types.SymbolName): string {
+        const properties = [`id: ID;`];
+    
+        return `export interface ${name}FindOneQueryArgs {\n${this._indent(properties)}\n}`;
+    }
+
+    _emitInterfaceFindManyQueryArgs(node: Types.InterfaceNode, name: Types.SymbolName): string {
+        const properties = [
+            `where?: ${name}WhereInput | null | undefined;`,
+            `orderBy?: ${name}OrderByInput | null | undefined;`,
+            'skip?: number;',
+            'after?: string;',
+            'before?: string;',
+            'first?: number;',
+            'last?: number;'
+        ];
+    
+        return `export interface ${name}FindManyQueryArgs {\n${this._indent(properties)}\n}`;
     }
 
     _emitInterfaceOrderByInput(node: Types.InterfaceNode, name: Types.SymbolName): string {
@@ -368,7 +434,17 @@ export default class Emitter {
             }
         });
     
-        return `enum ${name}OrderByInput {\n${this._indent(properties.flat())}\n}`;
+        return `export enum ${name}OrderByInput {\n${this._indent(properties.flat().join(',\n'))}\n}`;
+    }
+
+    _emitInterfacePayload(node: Types.InterfaceNode, name: Types.SymbolName): string {
+        const camelCasedName = name.charAt(0).toLowerCase() + name.substr(1);
+        const properties = [
+            `${camelCasedName}?: ${name};`,
+            `errors?: Error[];`,
+        ];
+    
+        return `export interface ${name}Payload {\n${this._indent(properties)}\n}`;
     }
 
     _emitInterfaceUpdateInput(node: Types.InterfaceNode, name: Types.SymbolName): string {
@@ -405,7 +481,7 @@ export default class Emitter {
             }
         });
     
-        return `input ${name}UpdateInput {\n${this._indent(properties.filter(p => !!(p)))}\n}`;
+        return `export interface ${name}UpdateInput {\n${this._indent(properties.filter(p => !!(p)))}\n}`;
     }
 
     _emitInterfaceUpdateInputClauses = (node: Types.Node, name: Types.SymbolName): string => {
@@ -419,27 +495,36 @@ export default class Emitter {
             return this._emitInterfaceUpdateInputClauses(node.target, name);
         } else if (node.type === 'array') {
             if (node.elements[0].type === 'reference') {
-                return `${name}: ${node.elements[0].target}UpdateManyInput`;
+                return `${name}?: ${node.elements[0].target}UpdateManyInput;`;
             } else {
-                return `${name}: ${expression}`;
+                return `${name}?: ${expression};`;
             }
         } else if (node.type === 'reference') {
             if (this.enumNames.includes(expression) || this.scalarNames.includes(expression)) {
-                return `${name}: ${expression}`;
+                return `${name}?: ${expression};`;
             } else {
-                return `${name}: ${node.target}UpdateOneInput`;
+                return `${name}?: ${node.target}UpdateOneInput;`;
             }
         } else {
-            return `${name}: ${expression}`;
+            return `${name}?: ${expression};`;
         }
     }
 
     _emitInterfaceUpdateManyInput(node: Types.InterfaceNode, name: Types.SymbolName): string {
         const properties = [
-            `connect: [${name}WhereUniqueInput!]`
+            `connect?: ${name}WhereUniqueInput[]`
         ];
     
-        return `input ${name}UpdateManyInput {\n${this._indent(properties)}\n}`;
+        return `export interface ${name}UpdateManyInput {\n${this._indent(properties)}\n}`;
+    }
+
+    _emitInterfaceUpdateManyMutationArgs(node: Types.InterfaceNode, name: Types.SymbolName): string {
+        const properties = [
+            `data: ${name}UpdateManyMutationInput;`,
+            `where: ${name}WhereInput;`
+        ];
+    
+        return `export interface ${name}UpdateManyMutationArgs {\n${this._indent(properties)}\n}`;
     }
 
     _emitInterfaceUpdateManyMutationInput(node: Types.InterfaceNode, name: Types.SymbolName): string {
@@ -476,7 +561,7 @@ export default class Emitter {
             }
         });
     
-        return `input ${name}UpdateManyMutationInput {\n${this._indent(properties.filter(p => !!(p)))}\n}`;
+        return `export interface ${name}UpdateManyMutationInput {\n${this._indent(properties.filter(p => !!(p)))}\n}`;
     }
 
     _emitInterfaceUpdateManyMutationInputClauses = (node: Types.Node, name: Types.SymbolName): string => {
@@ -492,21 +577,40 @@ export default class Emitter {
             return ''; // can't update array on many objects simultaneously
         } else if (node.type === 'reference') {
             if (this.enumNames.includes(expression) || this.scalarNames.includes(expression)) {
-                return `${name}: ${expression}`;
+                return `${name}?: ${expression};`;
             } else {
                 return ''; // can't update reference on many objects simultaneously
             }
         } else {
-            return `${name}: ${expression}`;
+            return `${name}?: ${expression};`;
         }
     }
 
     _emitInterfaceUpdateOneInput(node: Types.InterfaceNode, name: Types.SymbolName): string {
         const properties = [
-            `connect: ${name}WhereUniqueInput`
+            `connect?: ${name}WhereUniqueInput`
         ];
     
-        return `input ${name}UpdateOneInput {\n${this._indent(properties)}\n}`;
+        return `export interface ${name}UpdateOneInput {\n${this._indent(properties)}\n}`;
+    }
+
+    _emitInterfaceUpdateOneMutationArgs(node: Types.InterfaceNode, name: Types.SymbolName): string {
+        const properties = [
+            `id: ID;`,
+            `data: ${name}UpdateInput;`
+        ];
+    
+        return `export interface ${name}UpdateOneMutationArgs {\n${this._indent(properties)}\n}`;
+    }
+
+    _emitInterfaceUpsertOneMutationArgs(node: Types.InterfaceNode, name: Types.SymbolName): string {
+        const properties = [
+            `id: ID;`,
+            `create: ${name}CreateInput;`,
+            `update: ${name}UpdateInput;`
+        ];
+    
+        return `export interface ${name}UpsertOneMutationArgs {\n${this._indent(properties)}\n}`;
     }
 
     _emitInterfaceWhereInput(node: Types.InterfaceNode, name: Types.SymbolName): string {
@@ -543,12 +647,12 @@ export default class Emitter {
             }
         });
         properties.push([
-            `AND: [${name}WhereInput!]`,
-            `OR: [${name}WhereInput!]`,
-            `NOT: [${name}WhereInput!]`
+            `AND?: ${name}WhereInput[];`,
+            `OR?: ${name}WhereInput[];`,
+            `NOT?: ${name}WhereInput[];`
         ]);
     
-        return `input ${name}WhereInput {\n${this._indent(properties.flat())}\n}`;
+        return `export interface ${name}WhereInput {\n${this._indent(properties.flat())}\n}`;
     }
 
     _emitInterfaceWhereInputClauses = (node: Types.Node, name: Types.SymbolName): string[] => {
@@ -560,86 +664,86 @@ export default class Emitter {
             return this._emitInterfaceWhereInputClauses(node.target, name);
         } else if (node.type === 'string' || expression === 'ID') {
             return [
-                `${name}: ${expression}`,
-                `${name}_not: ${expression}`,
-                `${name}_in: [${expression}!]`,
-                `${name}_not_in: [${expression}!]`,
-                `${name}_lt: ${expression}`,
-                `${name}_lte: ${expression}`,
-                `${name}_gt: ${expression}`,
-                `${name}_gte: ${expression}`,
-                `${name}_contains: ${expression}`,
-                `${name}_not_contains: ${expression}`,
-                `${name}_starts_with: ${expression}`,
-                `${name}_not_starts_with: ${expression}`,
-                `${name}_ends_with: ${expression}`,
-                `${name}_not_ends_with: ${expression}`,
+                `${name}?: ${expression};`,
+                `${name}_not?: ${expression};`,
+                `${name}_in?: ${expression}[];`,
+                `${name}_not_in?: ${expression}[];`,
+                `${name}_lt?: ${expression};`,
+                `${name}_lte?: ${expression};`,
+                `${name}_gt?: ${expression};`,
+                `${name}_gte?: ${expression};`,
+                `${name}_contains?: ${expression};`,
+                `${name}_not_contains?: ${expression};`,
+                `${name}_starts_with?: ${expression};`,
+                `${name}_not_starts_with?: ${expression};`,
+                `${name}_ends_with?: ${expression};`,
+                `${name}_not_ends_with?: ${expression};`,
             ];
         } else if (node.type === 'number') {  // TODO: Int/Float annotation
             return [
-                `${name}: ${expression}`,
-                `${name}_not: ${expression}`,
-                `${name}_in: [${expression}!]`,
-                `${name}_not_in: [${expression}!]`,
-                `${name}_lt: ${expression}`,
-                `${name}_lte: ${expression}`,
-                `${name}_gt: ${expression}`,
-                `${name}_gte: ${expression}`,
+                `${name}?: ${expression};`,
+                `${name}_not?: ${expression};`,
+                `${name}_in?: ${expression}[];`,
+                `${name}_not_in?: ${expression}[];`,
+                `${name}_lt?: ${expression};`,
+                `${name}_lte?: ${expression};`,
+                `${name}_gt?: ${expression};`,
+                `${name}_gte?: ${expression};`,
             ];
         } else if (node.type === 'boolean') {
             return [
-                `${name}: ${expression}`,
-                `${name}_not: ${expression}`,
-                `${name}_in: [${expression}!]`,
-                `${name}_not_in: [${expression}!]`,
+                `${name}?: ${expression};`,
+                `${name}_not?: ${expression};`,
+                `${name}_in?: ${expression}[];`,
+                `${name}_not_in?: ${expression}[];`,
             ];
         } else if (expression === 'Date' || expression === 'DateTime') {
             return [
-                `${name}: ${expression}`,
-                `${name}_not: ${expression}`,
-                `${name}_in: [${expression}!]`,
-                `${name}_not_in: [${expression}!]`,
-                `${name}_lt: ${expression}`,
-                `${name}_lte: ${expression}`,
-                `${name}_gt: ${expression}`,
-                `${name}_gte: ${expression}`,
+                `${name}?: ${expression};`,
+                `${name}_not?: ${expression};`,
+                `${name}_in?: ${expression}[];`,
+                `${name}_not_in?: ${expression}[];`,
+                `${name}_lt?: ${expression};`,
+                `${name}_lte?: ${expression};`,
+                `${name}_gt?: ${expression};`,
+                `${name}_gte?: ${expression};`,
             ];
         } else if (node.type === 'array') {
             return [
-                `${name}_every: ${this._emitExpression(node.elements[0])}WhereInput`,
-                `${name}_some: ${this._emitExpression(node.elements[0])}WhereInput`,
-                `${name}_none: ${this._emitExpression(node.elements[0])}WhereInput`,
+                `${name}_every?: ${this._emitExpression(node.elements[0])}WhereInput;`,
+                `${name}_some?: ${this._emitExpression(node.elements[0])}WhereInput;`,
+                `${name}_none?: ${this._emitExpression(node.elements[0])}WhereInput;`,
             ];
         } else if (node.type === 'reference') {
             if (this.enumNames.includes(expression)) {
                 return [
-                    `${name}: ${expression}`,
-                    `${name}_not: ${expression}`,
-                    `${name}_in: [${expression}!]`,
-                    `${name}_not_in: [${expression}!]`,
+                    `${name}?: ${expression};`,
+                    `${name}_not?: ${expression};`,
+                    `${name}_in?: ${expression}[];`,
+                    `${name}_not_in?: ${expression}[];`,
                 ];
             } else if (this.scalarNames.includes(expression)) {
                 // since string has the largest set of operations, we use it
                 return [
-                    `${name}: ${expression}`,
-                    `${name}_not: ${expression}`,
-                    `${name}_in: [${expression}!]`,
-                    `${name}_not_in: [${expression}!]`,
-                    `${name}_lt: ${expression}`,
-                    `${name}_lte: ${expression}`,
-                    `${name}_gt: ${expression}`,
-                    `${name}_gte: ${expression}`,
-                    `${name}_contains: ${expression}`,
-                    `${name}_not_contains: ${expression}`,
-                    `${name}_starts_with: ${expression}`,
-                    `${name}_not_starts_with: ${expression}`,
-                    `${name}_ends_with: ${expression}`,
-                    `${name}_not_ends_with: ${expression}`,
+                    `${name}?: ${expression};`,
+                    `${name}_not?: ${expression};`,
+                    `${name}_in?: ${expression}[];`,
+                    `${name}_not_in?: ${expression}[];`,
+                    `${name}_lt?: ${expression};`,
+                    `${name}_lte?: ${expression};`,
+                    `${name}_gt?: ${expression};`,
+                    `${name}_gte?: ${expression};`,
+                    `${name}_contains?: ${expression};`,
+                    `${name}_not_contains?: ${expression};`,
+                    `${name}_starts_with?: ${expression};`,
+                    `${name}_not_starts_with?: ${expression};`,
+                    `${name}_ends_with?: ${expression};`,
+                    `${name}_not_ends_with?: ${expression};`,
                 ];
             }
 
             return [
-                `${name}: ${expression}WhereInput`,
+                `${name}?: ${expression}WhereInput;`,
             ];
         }
         // else if (node.type === 'literal object' || node.type === 'interface') {
@@ -655,91 +759,104 @@ export default class Emitter {
     }
 
     _emitInterfaceWhereUniqueInput(node: Types.InterfaceNode, name: Types.SymbolName): string {
-        const properties = [`id: ID!`];
+        const properties = [`id: ID;`];
     
-        return `input ${name}WhereUniqueInput {\n${this._indent(properties.flat())}\n}`;
+        return `export interface ${name}WhereUniqueInput {\n${this._indent(properties)}\n}`;
     }
 
-    _emitMutationExtension(node: Types.InterfaceNode, name: Types.SymbolName): string {
+    _emitMethod(node: Types.MethodNode,): string {
+        let parameters: string[] = [];
+        _.forEach(node.parameters, (parameter, name) => {
+            parameters.push(`${name}: ${this._emitExpression(parameter)}`);
+        })
+
+        const mark = node.optional ? '?' : '';
+        const nameSection = node.name ? `${this._name(node.name)}${mark}: ` : '';
+        const returnType = this._emitExpression(node.returns);
+        return `${nameSection}(${parameters.join(', ')}) => ${returnType}`;
+    }
+
+    _emitProperty(node: Types.PropertyNode): string {
+        const mark = node.optional ? '?' : '';
+        const nameSection = node.name ? `${this._name(node.name)}${mark}: ` : '';
+        return `${nameSection}${this._emitExpression(node.signature)}`;
+    }
+
+    _emitMutationExtension(node: Types.InterfaceNode, name: Types.SymbolName): void {
         const pascalCasedName = name.charAt(0).toUpperCase() + name.substr(1);
  
-        const createMutation = `create${pascalCasedName}(data: ${name}CreateInput!): ${name}!`;
-        const deleteMutation = `delete${pascalCasedName}(id: ID!): ${name}`;
-        const deleteManyMutation = `deleteMany${pascalCasedName}s(where: ${name}WhereInput): ${name}BatchPayload!`;
-        const updateMutation = `update${pascalCasedName}(id: ID!, data: ${name}UpdateInput!): ${name}`;
-        const updateManyMutation = `updateMany${pascalCasedName}s(data: ${name}UpdateManyMutationInput!, where: ${name}WhereInput): ${name}BatchPayload!`;
-        const upsertMutation = `upsert${pascalCasedName}(id: ID!, create: ${name}CreateInput!, update: ${name}UpdateInput!): ${name}!`
-
-        const properties = [
-            createMutation,
-            deleteMutation,
-            deleteManyMutation,
-            updateMutation,
-            updateManyMutation,
-            upsertMutation
-        ];
-
-        return `extend type Mutation {\n${this._indent(properties)}\n}`;
-    }
-
-    _emitQueryExtension(node: Types.InterfaceNode, name: Types.SymbolName): string {
-        const camelCasedName = name.charAt(0).toLowerCase() + name.substr(1);
-
-        const singularQuery = `${camelCasedName}(id: ID!): ${name}`;
-        // const singularQuery2 = `${camelCasedName}(where: ${name}WhereUniqueInput!): ${name}`;
-        const queryParams = `where: ${name}WhereInput, orderBy: ${name}OrderByInput, skip: Int, after: String, before: String, first: Int, last: Int`;
-        const pluralQuery = `${camelCasedName}s(${queryParams}): [${name}]!`;
-
-        const properties = [
-            singularQuery,
-            pluralQuery
-        ];
-
-        return `extend type Query {\n${this._indent(properties)}\n}`;
-    }
-
-    _emitUnion(node: Types.UnionNode, name: Types.SymbolName): string {
-        if (_.every(node.types, entry => entry.type === 'string literal')) {
-            const nodeValues = node.types.map((type: Types.Node) => (type as Types.StringLiteralNode).value);
-            return this._emitEnum({
-                type: 'enum',
-                values: _.uniq(nodeValues),
-            }, this._name(name));
-        }
-    
-        node.types.map(type => {
-            if (type.type !== 'reference') {
-                throw new Error(`GraphQL unions require that all types are references. Got a ${type.type}`);
+        this.mutationResolvers.members.push({
+            type: 'property',
+            name: `create${pascalCasedName}`,
+            signature: {
+                type: 'reference',
+                target: `__Resolver<{}, ${name}CreateOneMutationArgs, ${name}Payload>`
+            }
+        }, {
+            type: 'property',
+            name: `delete${pascalCasedName}`,
+            signature: {
+                type: 'reference',
+                target: `__Resolver<{}, ${name}FindOneQueryArgs, ${name}Payload>`
+            }
+        }, {
+            type: 'property',
+            name: `deleteMany${pascalCasedName}s`,
+            signature: {
+                type: 'reference',
+                target: `__Resolver<{}, ${name}DeleteManyMutationArgs, ${name}BatchPayload>`
+            }
+        }, {
+            type: 'property',
+            name: `update${pascalCasedName}`,
+            signature: {
+                type: 'reference',
+                target: `__Resolver<{}, ${name}UpdateOneMutationArgs, ${name}Payload>`
+            }
+        }, {
+            type: 'property',
+            name: `updateMany${pascalCasedName}s`,
+            signature: {
+                type: 'reference',
+                target: `__Resolver<{}, ${name}UpdateManyMutationArgs, ${name}BatchPayload>`
+            }
+        }, {
+            type: 'property',
+            name: `upsert${pascalCasedName}`,
+            signature: {
+                type: 'reference',
+                target: `__Resolver<{}, ${name}UpsertOneMutationArgs, ${name}Payload>`
             }
         });
+    }
+
+    _emitQueryExtension(node: Types.InterfaceNode, name: Types.SymbolName): void {
+        const camelCasedName = name.charAt(0).toLowerCase() + name.substr(1);
+
+        this.queryResolvers.members.push({
+            type: 'property',
+            name: camelCasedName,
+            signature: {
+                type: 'reference',
+                target: `__Resolver<{}, ${name}FindOneQueryArgs, ${name}Payload>`
+            }
+        }, {
+            type: 'property',
+            name: `${camelCasedName}s`,
+            signature: {
+                type: 'reference',
+                target: `__Resolver<{}, ${name}FindManyQueryArgs, ${name}BatchPayload>`
+            }
+        });
+    }
+
+    _emitUnion(node: Types.UnionNode): string {
+        let unions: string[] = [];
+        _.forEach(node.types, union => {
+            unions.push(this._emitExpression(union));
+        })
     
-        const firstChild = node.types[0] as ReferenceNode;
-        const firstChildType = this.types[firstChild.target];
-        if (firstChildType.type === 'enum') {
-            const nodeTypes = node.types.map((type: Types.Node) => {
-                const subNode = this.types[(type as ReferenceNode).target];
-                if (subNode.type !== 'enum') {
-                    throw new Error(`Expected a union of only enums since first child is an enum. Got a ${type.type}`);
-                }
-                return subNode.values;
-            });
-            return this._emitEnum({
-                type: 'enum',
-                values: _.uniq(_.flatten(nodeTypes)),
-            }, this._name(name));
-        } else if (firstChildType.type === 'interface') {
-            const nodeNames = node.types.map((type: Types.Node) => {
-                const subNode = this.types[(type as ReferenceNode).target];
-                if (subNode.type !== 'interface') {
-                    throw new Error(`Expected a union of only interfaces since first child is an interface. ` +
-                        `Got a ${type.type}`);
-                }
-                return (type as ReferenceNode).target;
-            });
-            return `union ${this._name(name)} = ${nodeNames.join(' | ')}`;
-        } else {
-            throw new Error(`No support for unions of type: ${firstChildType.type}`);
-        }
+        return `(${unions.join(' | ')})`;
     }
 
     _getDocTag(node: Types.ComplexNode, prefix: string): string|null {
@@ -775,14 +892,18 @@ export default class Emitter {
         return node.type === 'string' || node.type === 'number' || node.type === 'boolean' || node.type === 'any';
     }
 
+    _isNamedNode(node: Types.Node): boolean {
+        return node.type === 'method' || node.type === 'property';
+    }
+
     _name = (name: Types.SymbolName): string => {
-        name = this.renames[name] || name;
-        return name.replace(/\W/g, '_');
+        return this.renames[name] || name;
     }
 
     _preprocessNode(node: Types.Node, name: Types.SymbolName):boolean {
         if (node.type === 'alias' && node.target.type === 'reference') {
             const referencedNode = this.types[node.target.target];
+            if (!referencedNode) return false;
             if (this._isPrimitive(referencedNode) || referencedNode.type === 'enum') {
                 this.renames[name] = node.target.target;
                 return true;

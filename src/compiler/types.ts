@@ -81,6 +81,12 @@ export interface AnyNode {
   type: 'any';
 }
 
+export interface ImportNode {
+  type:'import';
+  default?:string;
+  imports?:string[];
+}
+
 export type Node =
   InterfaceNode |
   MethodNode |
@@ -95,7 +101,8 @@ export type Node =
   StringNode |
   NumberNode |
   BooleanNode |
-  AnyNode;
+  AnyNode |
+  ImportNode;
 
 export type NamedNode = MethodNode | PropertyNode;
 
