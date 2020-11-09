@@ -148,7 +148,7 @@ export default class Emitter {
 
     _emitEnum(node:Types.EnumNode, name:Types.SymbolName):string {
         this.enumNames.push(this._name(name));
-        return `enum ${this._name(name)} {\n${this._indent(node.values.join(',\n'))}\n}`;
+        return `export enum ${this._name(name)} {\n${this._indent(node.values.join(',\n'))}\n}`;
     }
 
     _emitImport(node:Types.ImportNode, name:Types.SymbolName):string {
